@@ -15,28 +15,19 @@ app.use(express.json({ limit: '25mb' }))
  
 app.use(express.urlencoded({ extended: true, limit: '25mb' }))
 
-function makeRedisUrl() {
-  if (process.env.REDIS_URL) return process.env.REDIS_URL
-  const scheme = String(process.env.REDIS_SSL).toLowerCase() === 'true' ? 'rediss' : 'redis'
-  const host = process.env.REDIS_HOST || '127.0.0.1'
-  const port = process.env.REDIS_PORT || '6379'
-  const user = process.env.REDIS_USERNAME || ''
-  const pass = process.env.REDIS_PASSWORD || ''
-  const auth = user || pass ? `${user}:${pass}@` : ''
-  return `${scheme}://${auth}${host}:${port}`
-}
-const redis = createClient({ url: makeRedisUrl() })
+const redisUrl = process.env.REDIS_URL || ''
+const redis = createClient({ url: redisUrl })
 redis.on('error', (e) => { console.error('Redis error:', e.message) })
 try {
-  const infoUrl = makeRedisUrl()
-  let host = process.env.REDIS_HOST || '127.0.0.1'
-  let port = process.env.REDIS_PORT || '6379'
-  let ssl = String(process.env.REDIS_SSL || '').toLowerCase() === 'true'
+  const infoUrl = redisUrl
+  let host = ''
+  let port = ''
+  let ssl = false
   try {
     const u = new URL(infoUrl)
     host = u.hostname || host
     port = u.port || port
-    ssl = infoUrl.startsWith('rediss://') || ssl
+    ssl = infoUrl.startsWith('rediss://')
   } catch (_) {}
   console.log(`Redis connecting host=${host} port=${port} ssl=${ssl}`)
   await redis.connect()
@@ -72,6 +63,9 @@ function collapseSpaces(s) {
 function isDataUrl(u) {
   return typeof u === 'string' && u.startsWith('data:')
 }
+
+
+ 
 
 
 
@@ -337,23 +331,6 @@ function ensureJid(body) {
   return digits ? `${digits}@c.us` : ''
 }
 
-function shouldUseBot(body) {
-  const incoming = trimOrEmpty(get(body, 'message_type')).toLowerCase() === 'incoming'
-  const assigneeEmpty = isEmptyNumber(get(body, 'conversation.messages.0.conversation.assignee_id'))
-  const notIntegration = get(body, 'sender.identifier') !== 'whatsapp.integration'
-  return incoming && assigneeEmpty && notIntegration
-}
-
-function filterFlags(body) {
-  const incoming = get(body, 'message_type') === 'incoming'
-  const assigneeEmpty = isEmptyNumber(get(body, 'conversation.messages.0.conversation.assignee_id'))
-  const senderId = get(body, 'sender.identifier')
-  const notIntegration = senderId !== 'whatsapp.integration'
-  const jid = ensureJid(body)
-  const hasJid = jid !== ''
-  return { incoming, assigneeEmpty, notIntegration, hasJid, senderId, jid }
-}
-
 function buildMasterText(text, audio, image, imagenText, replyText) {
   // Mantener formato del flujo original: espacios dobles si faltan partes
   const parts = [text || '', audio || '', image || '', imagenText || '']
@@ -416,8 +393,6 @@ async function cleanRedisBuffer(key, maxKeep) {
   return final || []
 }
 
-const pendingRequests = {} // { jid: { res, timer } }
-const pendingEchoRequests = {}
 const pendingTimers = {} // { key: timer }
 
 function buildMessageData(mastertext, messageId, replyContextId, replyContextText, body, queryQ, cost, tokens) {
@@ -457,27 +432,13 @@ app.post(PATH, async (req, res) => {
     body = payload.body && typeof payload.body === 'object' ? payload.body : payload
   }
 
-  // --- FILTER MESSAGES ---
-  const senderType = get(body, 'sender.type') || get(body, 'sender_type')
   const messageType = get(body, 'message_type')
-  const senderIdentifier = get(body, 'sender.identifier')
-  // Buscamos assignee_id en varios lugares por si acaso
-  const assigneeId = get(body, 'conversation.assignee_id') || get(body, 'conversation.messages.0.conversation.assignee_id')
-  
-  // CONDICIONES PARA PROCESAR (Si no se cumplen, se ignora):
-  // 1. message_type == 'incoming'
-  // 2. assignee_id is empty
-  // 3. sender.identifier != 'whatsapp.integration'
-  
-  const shouldProcess = !(
-    messageType !== 'incoming' ||
-    assigneeId ||
-    senderIdentifier === 'whatsapp.integration' ||
-    senderType === 'Bot' ||
-    senderType === 'agent_bot' ||
-    senderType === 'AgentBot'
-  )
-  // ---------------------------
+  const assigneeRaw = get(body, 'conversation.meta.assignee')
+  const assigneeIsNullOrUndefined = assigneeRaw == null
+  if (String(messageType).toLowerCase() !== 'incoming' || !assigneeIsNullOrUndefined) {
+    console.log(`IGNORADO reason messageType=${messageType} assignee=${assigneeRaw}`)
+    return res.status(200).send('IGNORADO')
+  }
 
   // console.log('Extracted Body keys:', body ? Object.keys(body) : 'body is null/undefined')
   
@@ -785,14 +746,6 @@ async function safeRPush(key, value) {
     return await redis.rPush(key, value)
   } catch (_) {
     return 0
-  }
-}
-
-async function safeLIndex(key, index) {
-  try {
-    return await redis.lIndex(key, index)
-  } catch (_) {
-    return null
   }
 }
 
