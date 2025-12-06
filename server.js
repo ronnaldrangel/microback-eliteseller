@@ -65,6 +65,17 @@ function isDataUrl(u) {
 }
 
 
+function guessMimeFromUrl(u) {
+  if (typeof u !== 'string') return 'image/jpeg'
+  const m = u.toLowerCase()
+  if (m.endsWith('.jpg') || m.endsWith('.jpeg')) return 'image/jpeg'
+  if (m.endsWith('.png')) return 'image/png'
+  if (m.endsWith('.webp')) return 'image/webp'
+  if (m.endsWith('.gif')) return 'image/gif'
+  return 'image/jpeg'
+}
+
+
  
 
 
@@ -105,30 +116,7 @@ async function logUsage(model, usage, mastertext) {
 }
 
 async function analyzeImage(dataUrl, prompt) {
-  // Ensure we have a valid Data URL (Base64) to avoid redirect (302) issues with Groq/OpenAI
   let finalImageUrl = dataUrl
-  if (dataUrl && !isDataUrl(dataUrl)) {
-    try {
-      // console.log('Fetching image to convert to Base64...', dataUrl)
-      const { buf, mime } = await fetchBuffer(dataUrl)
-      
-      // Convert to PNG using Sharp to ensure compatibility (e.g. WebP stickers)
-      let finalBuf = buf
-      let finalMime = mime
-      try {
-          finalBuf = await sharp(buf).png().toBuffer()
-          finalMime = 'image/png'
-      } catch (sharpErr) {
-          console.warn('Sharp conversion failed, using original buffer:', sharpErr.message)
-      }
-
-      const b64 = finalBuf.toString('base64')
-      finalImageUrl = `data:${finalMime};base64,${b64}`
-    } catch (e) {
-      console.error('Error converting image to Base64:', e.message)
-      // Fallback to original URL if fetch fails
-    }
-  }
 
   const provider = process.env.AI_PROVIDER || 'openai'
   
@@ -165,6 +153,39 @@ async function analyzeImage(dataUrl, prompt) {
     } catch (err) {
       console.error('\x1b[31m%s\x1b[0m', `Groq Image analysis failed: ${err.message}`)
       console.error('Groq Original Image URL:', dataUrl)
+      const status = (err && (err.response?.status || err.status)) || null
+      const msg = String(err?.message || '')
+      const shouldRetry = (!isDataUrl(dataUrl)) && (status === 400 || msg.toLowerCase().includes('invalid image data'))
+      if (shouldRetry) {
+        try {
+          const { buf } = await fetchBuffer(dataUrl)
+          const mime = guessMimeFromUrl(dataUrl)
+          const b64 = buf.toString('base64')
+          const retryUrl = `data:${mime};base64,${b64}`
+          const r2 = await groq.chat.completions.create({
+            model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: prompt },
+                  { type: 'image_url', image_url: { url: retryUrl } }
+                ]
+              }
+            ],
+            max_tokens: 300
+          })
+          const c2 = r2.choices?.[0]?.message?.content || ''
+          let usageData2 = { cost: 0, tokens: 0 }
+          if (r2.usage) {
+            console.log('Groq Usage:', JSON.stringify(r2.usage))
+            usageData2 = await logUsage('meta-llama/llama-4-scout-17b-16e-instruct', r2.usage, prompt) || { cost: 0, tokens: 0 }
+          }
+          return { content: trimOrEmpty(c2), ...usageData2 }
+        } catch (err2) {
+          console.error('\x1b[31m%s\x1b[0m', `Groq Image retry failed: ${err2.message}`)
+        }
+      }
       return { content: '', cost: 0, tokens: 0 }
     }
   } else {
