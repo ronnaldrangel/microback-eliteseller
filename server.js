@@ -163,7 +163,13 @@ async function analyzeImage(dataUrl, prompt) {
 
       return { content: trimOrEmpty(c), ...usageData }
     } catch (err) {
+      const imageUrlPreview = finalImageUrl ? String(finalImageUrl).slice(0, 200) : ''
+      const originalUrlPreview = dataUrl ? String(dataUrl).slice(0, 200) : ''
+      const isData = finalImageUrl ? /^data:/i.test(finalImageUrl) : false
+      const status = (err && (err.response?.status || err.status)) || null
+      const errorData = (err && (err.response?.data || err.data || err.body)) || null
       console.error('\x1b[31m%s\x1b[0m', `Groq Image analysis failed: ${err.message}`)
+      console.error('Groq Image debug:', JSON.stringify({ image_url_preview: imageUrlPreview, image_url_is_data: isData, original_url_preview: originalUrlPreview, status, error: errorData }))
       return { content: '', cost: 0, tokens: 0 }
     }
   } else {
