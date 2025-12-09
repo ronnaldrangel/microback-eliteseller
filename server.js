@@ -92,9 +92,27 @@ async function bufferFromDataUrl(u) {
 
 async function fetchBuffer(u) {
   if (isDataUrl(u)) return bufferFromDataUrl(u)
-  const res = await fetch(u)
-  const ct = res.headers.get('content-type') || 'application/octet-stream'
-  const buf = Buffer.from(await res.arrayBuffer())
+  let res = await fetch(u, { redirect: 'follow' })
+  let ct = res.headers.get('content-type') || 'application/octet-stream'
+  let buf = Buffer.from(await res.arrayBuffer())
+  const small = buf.length < 1024
+  const looksXmlHtml = ct.includes('xml') || ct.includes('html')
+  const isActive = typeof u === 'string' && u.includes('/rails/active_storage/blobs/redirect/')
+  if ((small || looksXmlHtml) && isActive) {
+    try {
+      const urlObj = new URL(u)
+      urlObj.pathname = urlObj.pathname.replace('/blobs/redirect/', '/blobs/')
+      const url2 = urlObj.toString()
+      const res2 = await fetch(url2, { redirect: 'follow' })
+      const ct2 = res2.headers.get('content-type') || ct
+      const buf2 = Buffer.from(await res2.arrayBuffer())
+      if (buf2.length > buf.length && !(ct2.includes('xml') || ct2.includes('html'))) {
+        res = res2
+        ct = ct2
+        buf = buf2
+      }
+    } catch (_) {}
+  }
   return { buf, mime: ct }
 }
 
