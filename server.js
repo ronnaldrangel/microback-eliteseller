@@ -211,7 +211,7 @@ async function transcribeAudio(dataUrl) {
     console.log(`Audio buffer fetched url=${dataUrl} mime=${mime} size=${buf.length}`)
     const ext = getExtensionFromMime(mime)
     const filename = `audio.${ext}`
-    const blob = new Blob([buf], { type: mime })
+    const uploadFile = await OpenAI.toFile(buf, filename)
     const cacheKey = `cache:audio:${hashKey(dataUrl)}`
     const cached = await cacheGetJSON(cacheKey)
     if (cached && typeof cached === 'object') {
@@ -222,14 +222,17 @@ async function transcribeAudio(dataUrl) {
       return { content: '', cost: 0, tokens: 0 }
     }
     const openai = openaiClient || new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-    const r = await openai.audio.transcriptions.create({ model: 'whisper-1', file: blob, filename })
+    const r = await openai.audio.transcriptions.create({ model: 'whisper-1', file: uploadFile })
     const text = r.text || ''
     const usageData = await logUsage('whisper-1', { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, 'AUDIO TRANSCRIPTION') || { cost: 0, tokens: 0 }
     const out = { content: trimOrEmpty(text), ...usageData }
     await cacheSetJSON(cacheKey, out, AI_AUDIO_CACHE_TTL)
     return out
   } catch (err) {
-    console.error('\x1b[31m%s\x1b[0m', `Audio transcription failed url=${dataUrl} mime=${lastMime} size=${lastSize} error=${err.message}`)
+    const status = err?.status || err?.response?.status
+    const detail = (() => { try { return JSON.stringify(err?.error ?? err?.response ?? {}, null, 2) } catch (_) { return '' } })()
+    console.error('\x1b[31m%s\x1b[0m', `Audio transcription failed url=${dataUrl} mime=${lastMime} size=${lastSize} status=${status} error=${err?.message}`)
+    if (detail) console.error(detail)
     if (err && err.stack) console.error(err.stack)
     return { content: '', cost: 0, tokens: 0 }
   }
