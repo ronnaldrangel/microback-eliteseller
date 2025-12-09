@@ -503,7 +503,7 @@ app.post(PATH, async (req, res) => {
           if (!dUrl) continue
 
           if (fType === 'image') {
-              const result = await analyzeImage(dUrl, 'Analiza la imagen y descríbela para que otra IA la entienda sin verla: resume en 1 frase, extrae TODO el texto (OCR) y lista los elementos principales con su ubicación (arriba/abajo/izq/der). No inventes; si no estás seguro marca “dudoso”.')
+              const result = await analyzeImage(dUrl, '¿Analiza esta imagen profundamente, se breve?')
               if (result && result.content) {
                   combinedImages.push(result.content)
                   totalCost += (result.cost || 0)
