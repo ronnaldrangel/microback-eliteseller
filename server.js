@@ -3,16 +3,15 @@ import express from 'express'
 import cors from 'cors'
 import { OpenAI } from 'openai'
 import { createClient } from 'redis'
+import crypto from 'node:crypto'
  
 
-import { Groq } from 'groq-sdk'
 import sharp from 'sharp'
 
 const app = express()
+app.disable('x-powered-by')
 app.use(cors())
 app.use(express.json({ limit: '25mb' }))
-
- 
 app.use(express.urlencoded({ extended: true, limit: '25mb' }))
 
 const redisUrl = process.env.REDIS_URL || ''
@@ -37,6 +36,10 @@ try {
 }
 
 const PATH = '/webhook'
+const openaiClient = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null
+const AI_IMAGE_CACHE_TTL = Number(process.env.AI_IMAGE_CACHE_TTL || '86400')
+const AI_AUDIO_CACHE_TTL = Number(process.env.AI_AUDIO_CACHE_TTL || '86400')
+const AI_CONCURRENCY = Math.max(1, Number(process.env.AI_CONCURRENCY || '3'))
 
 function get(obj, path, def) {
   try {
@@ -115,111 +118,66 @@ async function logUsage(model, usage, mastertext) {
   return { cost, tokens: t_tokens }
 }
 
+function hashKey(s) {
+  try {
+    return crypto.createHash('sha1').update(String(s || ''), 'utf8').digest('hex')
+  } catch (_) {
+    return String(s || '')
+  }
+}
+
+async function cacheGetJSON(key) {
+  try {
+    const s = await redis.get(key)
+    return s ? JSON.parse(s) : null
+  } catch (_) {
+    return null
+  }
+}
+
+async function cacheSetJSON(key, obj, ttlSec) {
+  try {
+    await redis.set(key, JSON.stringify(obj || {}), { EX: Math.max(1, Number(ttlSec || 60)) })
+  } catch (_) {}
+}
+
 async function analyzeImage(dataUrl, prompt) {
   let finalImageUrl = dataUrl
 
-  const provider = process.env.AI_PROVIDER || 'openai'
-  
-  if (provider === 'groq') {
-    if (!process.env.GROQ_API_KEY) {
-      console.error('Groq API Key missing')
-      return ''
-    }
-    try {
-      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
-      const r = await groq.chat.completions.create({
-        model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              { type: 'image_url', image_url: { url: finalImageUrl } }
-            ]
-          }
-        ],
-        max_tokens: 300
-      })
-      const c = r.choices?.[0]?.message?.content || ''
-      
-      // Log usage
-      let usageData = { cost: 0, tokens: 0 }
-      if (r.usage) {
-        console.log('Groq Usage:', JSON.stringify(r.usage))
-        usageData = await logUsage('meta-llama/llama-4-scout-17b-16e-instruct', r.usage, prompt) || { cost: 0, tokens: 0 }
-      }
+  const cacheKey = `cache:image:${hashKey(dataUrl)}:${hashKey(prompt).slice(0, 8)}`
+  const cached = await cacheGetJSON(cacheKey)
+  if (cached && typeof cached === 'object') {
+    return { content: trimOrEmpty(cached.content || ''), cost: Number(cached.cost) || 0, tokens: Number(cached.tokens) || 0 }
+  }
 
-      return { content: trimOrEmpty(c), ...usageData }
-    } catch (err) {
-      console.error('\x1b[31m%s\x1b[0m', `Groq Image analysis failed: ${err.message}`)
-      console.error('Groq Original Image URL:', dataUrl)
-      const status = (err && (err.response?.status || err.status)) || null
-      const msg = String(err?.message || '')
-      const shouldRetry = (!isDataUrl(dataUrl)) && (status === 400 || msg.toLowerCase().includes('invalid image data'))
-      if (shouldRetry) {
-        try {
-          const { buf } = await fetchBuffer(dataUrl)
-          const mime = guessMimeFromUrl(dataUrl)
-          const b64 = buf.toString('base64')
-          const retryUrl = `data:${mime};base64,${b64}`
-          const r2 = await groq.chat.completions.create({
-            model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-            messages: [
-              {
-                role: 'user',
-                content: [
-                  { type: 'text', text: prompt },
-                  { type: 'image_url', image_url: { url: retryUrl } }
-                ]
-              }
-            ],
-            max_tokens: 300
-          })
-          const c2 = r2.choices?.[0]?.message?.content || ''
-          let usageData2 = { cost: 0, tokens: 0 }
-          if (r2.usage) {
-            console.log('Groq Usage:', JSON.stringify(r2.usage))
-            usageData2 = await logUsage('meta-llama/llama-4-scout-17b-16e-instruct', r2.usage, prompt) || { cost: 0, tokens: 0 }
-          }
-          return { content: trimOrEmpty(c2), ...usageData2 }
-        } catch (err2) {
-          console.error('\x1b[31m%s\x1b[0m', `Groq Image retry failed: ${err2.message}`)
+  if (!process.env.OPENAI_API_KEY) return { content: '', cost: 0, tokens: 0 }
+  try {
+    const openai = openaiClient || new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+    const r = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: finalImageUrl, detail: 'low' } }
+          ]
         }
-      }
-      return { content: '', cost: 0, tokens: 0 }
+      ],
+      max_tokens: 300
+    })
+    const c = r.choices?.[0]?.message?.content || ''
+    let usageData = { cost: 0, tokens: 0 }
+    if (r.usage) {
+      console.log('OpenAI Usage:', JSON.stringify(r.usage))
+      usageData = await logUsage('gpt-4o-mini', r.usage, prompt) || { cost: 0, tokens: 0 }
     }
-  } else {
-    // Default to OpenAI
-    if (!process.env.OPENAI_API_KEY) return { content: '', cost: 0, tokens: 0 }
-    try {
-      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-      const r = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              { type: 'image_url', image_url: { url: finalImageUrl, detail: 'low' } }
-            ]
-          }
-        ],
-        max_tokens: 300
-      })
-      const c = r.choices?.[0]?.message?.content || ''
-      
-      // Log usage
-      let usageData = { cost: 0, tokens: 0 }
-      if (r.usage) {
-        console.log('OpenAI Usage:', JSON.stringify(r.usage))
-        usageData = await logUsage('gpt-4o-mini', r.usage, prompt) || { cost: 0, tokens: 0 }
-      }
-
-      return { content: trimOrEmpty(c), ...usageData }
-    } catch (err) {
-      console.error('\x1b[31m%s\x1b[0m', `OpenAI Image analysis failed: ${err.message}`)
-      return { content: '', cost: 0, tokens: 0 }
-    }
+    const out = { content: trimOrEmpty(c), ...usageData }
+    await cacheSetJSON(cacheKey, out, AI_IMAGE_CACHE_TTL)
+    return out
+  } catch (err) {
+    console.error('\x1b[31m%s\x1b[0m', `OpenAI Image analysis failed: ${err.message}`)
+    return { content: '', cost: 0, tokens: 0 }
   }
 }
 
@@ -244,51 +202,50 @@ async function transcribeAudio(dataUrl) {
     const filename = `audio.${ext}`
     const file = new File([buf], filename, { type: mime })
     
-    const provider = process.env.AI_PROVIDER || 'openai'
-    
-    if (provider === 'groq') {
-      if (!process.env.GROQ_API_KEY) {
-        console.error('\x1b[31m%s\x1b[0m', 'Groq API key not found for audio transcription')
-        return { content: '', cost: 0, tokens: 0 }
-      }
-      
-      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
-      // console.log('Sending audio to Groq Whisper API for transcription...', filename)
-      const r = await groq.audio.transcriptions.create({ 
-        model: 'whisper-large-v3-turbo', 
-        file,
-        response_format: 'verbose_json'
-      })
-      const text = r.text || ''
-      const duration = r.duration || 0
-      
-      // Log usage (Audio: total_tokens stores DURATION in seconds for cost calculation)
-      const usageData = await logUsage('whisper-large-v3-turbo', { prompt_tokens: 0, completion_tokens: 0, total_tokens: duration }, 'AUDIO TRANSCRIPTION') || { cost: 0, tokens: 0 }
-  
-      // console.log('Audio transcription result:', text)
-      return { content: trimOrEmpty(text), ...usageData }
-    } else {
-      // OpenAI
-      if (!process.env.OPENAI_API_KEY) {
-        console.error('\x1b[31m%s\x1b[0m', 'OpenAI API key not found for audio transcription')
-        return { content: '', cost: 0, tokens: 0 }
-      }
-      
-      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-      // console.log('Sending audio to Whisper API for transcription...', filename)
-      const r = await openai.audio.transcriptions.create({ model: 'whisper-1', file })
-      const text = r.text || ''
-      
-      // Log usage (OpenAI Audio - also usually 0 tokens in response, but let's log it)
-      const usageData = await logUsage('whisper-1', { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, 'AUDIO TRANSCRIPTION') || { cost: 0, tokens: 0 }
-
-      return { content: trimOrEmpty(text), ...usageData }
+    const cacheKey = `cache:audio:${hashKey(dataUrl)}`
+    const cached = await cacheGetJSON(cacheKey)
+    if (cached && typeof cached === 'object') {
+      return { content: trimOrEmpty(cached.content || ''), cost: Number(cached.cost) || 0, tokens: Number(cached.tokens) || 0 }
     }
+    if (!process.env.OPENAI_API_KEY) {
+      console.error('\x1b[31m%s\x1b[0m', 'OpenAI API key not found for audio transcription')
+      return { content: '', cost: 0, tokens: 0 }
+    }
+    const openai = openaiClient || new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+    const r = await openai.audio.transcriptions.create({ model: 'whisper-1', file })
+    const text = r.text || ''
+    const usageData = await logUsage('whisper-1', { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, 'AUDIO TRANSCRIPTION') || { cost: 0, tokens: 0 }
+    const out = { content: trimOrEmpty(text), ...usageData }
+    await cacheSetJSON(cacheKey, out, AI_AUDIO_CACHE_TTL)
+    return out
 
   } catch (err) {
     console.error('\x1b[31m%s\x1b[0m', `Audio transcription failed: ${err.message}`)
     return { content: '', cost: 0, tokens: 0 }
   }
+}
+
+async function runWithConcurrency(tasks, limit) {
+  const results = new Array(tasks.length)
+  let idx = 0
+  const workers = []
+  const n = Math.min(limit, tasks.length)
+  for (let w = 0; w < n; w++) {
+    workers.push((async () => {
+      while (true) {
+        const i = idx
+        if (i >= tasks.length) break
+        idx = i + 1
+        try {
+          results[i] = await tasks[i]()
+        } catch (_) {
+          results[i] = null
+        }
+      }
+    })())
+  }
+  await Promise.all(workers)
+  return results
 }
 
 function buildReplyContext(body) {
@@ -463,6 +420,7 @@ app.post(PATH, async (req, res) => {
   }
 
   // console.log('Extracted Body keys:', body ? Object.keys(body) : 'body is null/undefined')
+  res.status(200).send('OK')
   
   const messageId = get(body, 'id', null)
   const replyContextId = buildReplyContext(body)
@@ -497,26 +455,30 @@ app.post(PATH, async (req, res) => {
   let totalTokens = 0
 
   if (attachments.length > 0) {
-      for (const att of attachments) {
+      const tasks = attachments.map(att => async () => {
           const fType = att.file_type
           const dUrl = att.data_url
-          if (!dUrl) continue
-
+          if (!dUrl) return null
           if (fType === 'image') {
               const result = await analyzeImage(dUrl, '¿Analiza esta imagen profundamente, se breve?')
-              if (result && result.content) {
-                  combinedImages.push(result.content)
-                  totalCost += (result.cost || 0)
-                  totalTokens += (result.tokens || 0)
-              }
+              return { kind: 'image', result }
           } else if (fType === 'audio') {
               const result = await transcribeAudio(dUrl)
-              if (result && result.content) {
-                  combinedAudios.push(result.content)
-                  totalCost += (result.cost || 0)
-                  totalTokens += (result.tokens || 0)
-              }
+              return { kind: 'audio', result }
           }
+          return null
+      })
+      const results = await runWithConcurrency(tasks, AI_CONCURRENCY)
+      for (const r of results) {
+        if (r && r.result && r.result.content) {
+          if (r.kind === 'image') {
+            combinedImages.push(r.result.content)
+          } else if (r.kind === 'audio') {
+            combinedAudios.push(r.result.content)
+          }
+          totalCost += (r.result.cost || 0)
+          totalTokens += (r.result.tokens || 0)
+        }
       }
   }
 
@@ -753,7 +715,7 @@ app.post(PATH, async (req, res) => {
         }
     }, debounceMs)
 
-  return res.status(200).send('OK')
+  return
 })
 
  
