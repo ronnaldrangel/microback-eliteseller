@@ -11,8 +11,8 @@ import sharp from 'sharp'
 const app = express()
 app.disable('x-powered-by')
 app.use(cors())
-app.use(express.json({ limit: '25mb' }))
-app.use(express.urlencoded({ extended: true, limit: '25mb' }))
+app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
 
 const redisUrl = process.env.REDIS_URL || ''
 const redis = createClient({ url: redisUrl })
@@ -40,6 +40,10 @@ const openaiClient = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.e
 const AI_IMAGE_CACHE_TTL = Number(process.env.AI_IMAGE_CACHE_TTL || '86400')
 const AI_AUDIO_CACHE_TTL = Number(process.env.AI_AUDIO_CACHE_TTL || '86400')
 const AI_CONCURRENCY = Math.max(1, Number(process.env.AI_CONCURRENCY || '3'))
+const DOWNLOAD_CONCURRENCY = Math.max(1, Number(process.env.DOWNLOAD_CONCURRENCY || '4'))
+const MIN_AUDIO_BYTES = Math.max(512, Number(process.env.MIN_AUDIO_BYTES || '1024'))
+const ATTACHMENT_MAX_RETRIES = Math.max(0, Number(process.env.ATTACHMENT_MAX_RETRIES || '3'))
+const ATTACHMENT_RETRY_MS = Math.max(0, Number(process.env.ATTACHMENT_RETRY_MS || '500'))
 
 function get(obj, path, def) {
   try {
@@ -92,7 +96,19 @@ async function bufferFromDataUrl(u) {
 
 async function fetchBuffer(u) {
   if (isDataUrl(u)) return bufferFromDataUrl(u)
-  let res = await fetch(u, { redirect: 'follow' })
+  const headers = {
+    'Accept': 'audio/*;q=0.9,image/*;q=0.9,*/*;q=0.8',
+    'User-Agent': 'mini-back-eliteseller/1.0'
+  }
+  const cookie = process.env.AS_COOKIE || ''
+  if (cookie) headers['Cookie'] = cookie
+  await acquireDownloadSlot()
+  let res
+  try {
+    res = await fetch(u, { redirect: 'follow', headers })
+  } finally {
+    releaseDownloadSlot()
+  }
   let ct = res.headers.get('content-type') || 'application/octet-stream'
   let buf = Buffer.from(await res.arrayBuffer())
   const small = buf.length < 1024
@@ -103,7 +119,13 @@ async function fetchBuffer(u) {
       const urlObj = new URL(u)
       urlObj.pathname = urlObj.pathname.replace('/blobs/redirect/', '/blobs/')
       const url2 = urlObj.toString()
-      const res2 = await fetch(url2, { redirect: 'follow' })
+      await acquireDownloadSlot()
+      let res2
+      try {
+        res2 = await fetch(url2, { redirect: 'follow', headers })
+      } finally {
+        releaseDownloadSlot()
+      }
       const ct2 = res2.headers.get('content-type') || ct
       const buf2 = Buffer.from(await res2.arrayBuffer())
       if (buf2.length > buf.length && !(ct2.includes('xml') || ct2.includes('html'))) {
@@ -114,6 +136,22 @@ async function fetchBuffer(u) {
     } catch (_) {}
   }
   return { buf, mime: ct }
+}
+
+let downloadingActive = 0
+const downloadWaiters = []
+async function acquireDownloadSlot() {
+  if (downloadingActive < DOWNLOAD_CONCURRENCY) {
+    downloadingActive++
+    return
+  }
+  await new Promise(res => downloadWaiters.push(res))
+  downloadingActive++
+}
+function releaseDownloadSlot() {
+  downloadingActive = Math.max(0, downloadingActive - 1)
+  const w = downloadWaiters.shift()
+  if (w) try { w() } catch (_) {}
 }
 
 async function logUsage(model, usage, mastertext) {
@@ -227,6 +265,11 @@ async function transcribeAudio(dataUrl) {
     lastMime = mime
     lastSize = buf?.length || 0
     console.log(`Audio buffer fetched url=${dataUrl} mime=${mime} size=${buf.length}`)
+    const supported = /(audio|mpeg|mpga|mp3|mp4|wav|webm|ogg|oga|m4a)/i.test(mime)
+    if (!supported || buf.length < MIN_AUDIO_BYTES) {
+      console.error('\x1b[31m%s\x1b[0m', `Audio download invalid url=${dataUrl} mime=${mime} size=${buf.length} (supported=${supported} minBytes=${MIN_AUDIO_BYTES})`)
+      return { content: '', cost: 0, tokens: 0 }
+    }
     const ext = getExtensionFromMime(mime)
     const filename = `audio.${ext}`
     const uploadFile = await OpenAI.toFile(buf, filename)
@@ -240,7 +283,7 @@ async function transcribeAudio(dataUrl) {
       return { content: '', cost: 0, tokens: 0 }
     }
     const openai = openaiClient || new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-    const r = await openai.audio.transcriptions.create({ model: 'whisper-1', file: uploadFile })
+    const r = await openai.audio.transcriptions.create({ model: 'whisper-1', file: uploadFile, language: 'es' })
     const text = r.text || ''
     const usageData = await logUsage('whisper-1', { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, 'AUDIO TRANSCRIPTION') || { cost: 0, tokens: 0 }
     const out = { content: trimOrEmpty(text), ...usageData }
@@ -404,6 +447,163 @@ async function cleanRedisBuffer(key, maxKeep) {
 }
 
 const pendingTimers = {} // { key: timer }
+const attachmentQueues = new Map() // key -> [jobs]
+const processingQueueKeys = new Set() // keys currently processing
+
+function setDebounceTimer(jid, key, type, queryQ, body, clearExisting) {
+  if (clearExisting && pendingTimers[key]) {
+    clearTimeout(pendingTimers[key])
+    delete pendingTimers[key]
+  }
+  if (pendingTimers[key]) return
+  let debounceSeconds = Number(process.env.DEBOUNCE_SECONDS || '5')
+  if (type === 'AUDIO' || type === 'IMAGEN' || type === 'IMAGE-TEXT') {
+    debounceSeconds = Math.max(debounceSeconds, 10)
+  }
+  const debounceMs = debounceSeconds * 1000
+  const convIdRaw =
+    get(body, 'conversation.messages.0.conversation_id') ||
+    get(body, 'conversation.id') ||
+    null
+  const keyConv = String(key).startsWith('conv_') ? String(key).slice(5).replace('_buffer', '') : null
+  const displayId = convIdRaw != null ? String(convIdRaw) : (keyConv || jid)
+  console.log(`Waiting ${debounceSeconds}s for more messages from conv=${displayId}...`)
+  pendingTimers[key] = setTimeout(async () => {
+    console.log(`debounce timeout conv=${displayId} key=${key}`)
+    const maxKeep2Raw = Number(process.env.REDIS_MAX_BUFFER || '20')
+    const maxKeep2 = Number.isFinite(maxKeep2Raw) && maxKeep2Raw >= 1 ? maxKeep2Raw : 20
+    let list = await cleanRedisBuffer(key, maxKeep2)
+    const uniqueMap = new Map()
+    const uniqueList = []
+    for (const itemStr of list) {
+      try {
+        const item = JSON.parse(itemStr)
+        if (item.id) {
+          if (!uniqueMap.has(String(item.id))) {
+            uniqueMap.set(String(item.id), true)
+            uniqueList.push(itemStr)
+          }
+        } else {
+          uniqueList.push(itemStr)
+        }
+      } catch (_) {
+        uniqueList.push(itemStr)
+      }
+    }
+    list = uniqueList
+    await safeDel(key)
+    console.log(`buffer consumed key=${key}`)
+    delete pendingTimers[key]
+    if (list.length === 0) {
+      console.log(`no messages to forward conv=${displayId} key=${key}`)
+      return
+    }
+    let conversationMeta = {}
+    let rootQuery = null
+    let rootWahaJid = null
+    let rootConvId = null
+    if (list.length > 0) {
+      try {
+        const lastItem = JSON.parse(list[list.length - 1])
+        if (lastItem._raw_conversation) {
+          conversationMeta = lastItem._raw_conversation
+        }
+        rootQuery = lastItem._query
+        rootWahaJid = lastItem.waha_whatsapp_jid
+        rootConvId = lastItem.conversation_id
+      } catch (_) {}
+    }
+    const cleanedList = list
+      .map(itemStr => {
+        try {
+          const item = JSON.parse(itemStr)
+          return collapseSpaces(trimOrEmpty(item.mastertext || ''))
+        } catch (_) {
+          return ''
+        }
+      })
+      .filter(mt => !!mt)
+    const webhookBaseUrl = process.env.WEBHOOK_URL
+    const finalQ = rootQuery || queryQ
+    const targetUrl = webhookBaseUrl && finalQ ? `${webhookBaseUrl}?q=${encodeURIComponent(finalQ)}` : (webhookBaseUrl || '')
+    let responsePayload = {}
+    if (body && typeof body === 'object') {
+      responsePayload = { ...body }
+    }
+    responsePayload.mastertext = cleanedList || []
+    console.log(`forwarding grouped count=${responsePayload.mastertext.length} url=${targetUrl}`)
+    try {
+      console.log(`sending to webhook url=${targetUrl} count=${responsePayload.mastertext.length}`)
+      const r = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(responsePayload)
+      })
+      console.log(`webhook response status=${r.status} ok=${r.ok}`)
+      console.log(`forwarded grouped count=${responsePayload.mastertext.length} url=${targetUrl}`)
+    } catch (err) {
+      console.error('\x1b[31m%s\x1b[0m', `Error forwarding to EliteSeller: ${err.message}`)
+    }
+  }, debounceMs)
+}
+
+function enqueueAttachmentJob(key, job) {
+  const q = attachmentQueues.get(key) || []
+  // dedup in queue
+  if (job.messageId && q.some(j => String(j.messageId) === String(job.messageId) && j.data_url === job.data_url)) {
+    return
+  }
+  q.push(job)
+  attachmentQueues.set(key, q)
+  if (!processingQueueKeys.has(key)) {
+    processAttachmentQueue(key).catch(() => {})
+  }
+}
+
+async function processAttachmentQueue(key) {
+  if (processingQueueKeys.has(key)) return
+  processingQueueKeys.add(key)
+  try {
+    let q = attachmentQueues.get(key) || []
+    while (q.length > 0) {
+      const job = q.shift()
+      attachmentQueues.set(key, q)
+      let attempts = 0
+      let result = null
+      while (attempts <= ATTACHMENT_MAX_RETRIES) {
+        try {
+          if (job.kind === 'audio') {
+            result = await transcribeAudio(job.data_url)
+          } else if (job.kind === 'image') {
+            result = await analyzeImage(job.data_url, '¿Analiza esta imagen profundamente, se breve?')
+          }
+          if (result && result.content) break
+        } catch (_) {}
+        attempts++
+        if (attempts <= ATTACHMENT_MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, ATTACHMENT_RETRY_MS))
+        }
+      }
+      if (result && result.content) {
+        const imageStr = job.kind === 'image' ? `IMAGE: ${result.content}` : ''
+        const audioStr = job.kind === 'audio' ? `AUDIO: ${result.content}` : ''
+        const mtRaw = buildMasterText('', audioStr, imageStr, '', job.replyContextText)
+        const mt = collapseSpaces(mtRaw)
+        const messageData = buildMessageData(mt, job.messageId, job.replyContextId, job.replyContextText, job.body, job.queryQ, result.cost, result.tokens)
+        await safeRPush(key, JSON.stringify(messageData))
+        const maxKeepRaw = Number(process.env.REDIS_MAX_BUFFER || '20')
+        const maxKeep = Number.isFinite(maxKeepRaw) && maxKeepRaw >= 1 ? maxKeepRaw : 20
+        const curLen = await safeLLen(key)
+        if (curLen > maxKeep) {
+          await safeLTrim(key, curLen - maxKeep, -1)
+        }
+        setDebounceTimer(job.jid, key, job.kind === 'audio' ? 'AUDIO' : 'IMAGEN', job.queryQ, job.body, false)
+      }
+    }
+  } finally {
+    processingQueueKeys.delete(key)
+  }
+}
 
 function buildMessageData(mastertext, messageId, replyContextId, replyContextText, body, queryQ, cost, tokens) {
   return {
@@ -480,58 +680,7 @@ app.post(PATH, async (req, res) => {
   let audio = ''
   let imagenText = ''
 
-  let combinedImages = []
-  let combinedAudios = []
-  let totalCost = 0
-  let totalTokens = 0
-
-  if (attachments.length > 0) {
-      const tasks = attachments.map(att => async () => {
-          const fType = att.file_type
-          const dUrl = att.data_url
-          if (!dUrl) return null
-          if (fType === 'image') {
-              const result = await analyzeImage(dUrl, '¿Analiza esta imagen profundamente, se breve?')
-              return { kind: 'image', result }
-          } else if (fType === 'audio') {
-              const result = await transcribeAudio(dUrl)
-              return { kind: 'audio', result }
-          }
-          return null
-      })
-      const results = await runWithConcurrency(tasks, AI_CONCURRENCY)
-      for (const r of results) {
-        if (r && r.result && r.result.content) {
-          if (r.kind === 'image') {
-            combinedImages.push(r.result.content)
-          } else if (r.kind === 'audio') {
-            combinedAudios.push(r.result.content)
-          }
-          totalCost += (r.result.cost || 0)
-          totalTokens += (r.result.tokens || 0)
-        }
-      }
-  }
-
-  // Construct final strings
-  if (combinedImages.length > 0) {
-      // If text exists, treat as IMAGE-TEXT, else IMAGEN
-      // But actually we just append all analyses
-      const joinedImages = combinedImages.join('\n---\n')
-      if (text) {
-          // IMAGE-TEXT scenario
-          imagenText = `IMAGE: ${joinedImages} IMAGEN-FOOTER:${text}`
-          type = 'IMAGE-TEXT' // force update type for logging if needed
-      } else {
-          image = `IMAGE: ${joinedImages}`
-          type = 'IMAGEN'
-      }
-  }
-  
-  if (combinedAudios.length > 0) {
-      audio = `AUDIO: ${combinedAudios.join('\n---\n')}`
-      if (!image && !imagenText) type = 'AUDIO'
-  }
+  // Construct final strings (adjuntos se procesan en background por la cola)
 
   if (!image && !imagenText && !audio && text) {
       type = 'TEXT'
@@ -547,8 +696,13 @@ app.post(PATH, async (req, res) => {
   
 
   const jid = ensureJid(body)
-  const convId = get(body, 'conversation.messages.0.conversation_id')
-  const key = convId ? `conv_${convId}_buffer` : `${jid}_buffer`
+  const convIdRaw =
+    get(body, 'conversation.messages.0.conversation_id') ||
+    get(body, 'conversation.id') ||
+    get(body, 'conversation.contact_inbox.id') ||
+    get(body, 'conversation.contact_inbox.source_id')
+  const convId = convIdRaw != null ? String(convIdRaw) : null
+  const key = `conv_${convId || 'unknown'}_buffer`
 
   const qFromPayload = Array.isArray(payload) ? get(payload[0], 'query.q') : get(payload, 'query.q')
   const queryQ = req.query.q || ''
@@ -558,6 +712,24 @@ app.post(PATH, async (req, res) => {
   if (flush === 'true' || flush === true) {
     // console.log(`Flushing buffer for key: ${key}`)
     await safeDel(key)
+  }
+
+  if (attachments.length > 0) {
+    for (const att of attachments) {
+      const fType = att.file_type
+      const dUrl = att.data_url
+      if (!dUrl) continue
+      enqueueAttachmentJob(key, {
+        kind: fType,
+        data_url: dUrl,
+        jid,
+        queryQ,
+        body,
+        replyContextText,
+        replyContextId,
+        messageId
+      })
+    }
   }
 
   if (mastertext) {
@@ -598,7 +770,8 @@ app.post(PATH, async (req, res) => {
         }
 
         if (!isDuplicate) {
-          const messageData = buildMessageData(mastertext, messageId, replyContextId, replyContextText, body, queryQ, totalCost, totalTokens)
+          const messageData = buildMessageData(mastertext, messageId, replyContextId, replyContextText, body, queryQ, 0, 0)
+          if (convId) messageData.conversation_id = convId
           // console.log('Adding new message to Redis:', JSON.stringify(messageData))
           await safeRPush(key, JSON.stringify(messageData))
           const maxKeepRaw = Number(process.env.REDIS_MAX_BUFFER || '20')
@@ -626,7 +799,8 @@ app.post(PATH, async (req, res) => {
       }
       
       if (!isDuplicate) {
-          const messageData = buildMessageData(mastertext, messageId, replyContextId, replyContextText, body, queryQ, totalCost, totalTokens)
+          const messageData = buildMessageData(mastertext, messageId, replyContextId, replyContextText, body, queryQ, 0, 0)
+          if (convId) messageData.conversation_id = convId
           // console.log('Adding new message to Redis (no-ID):', JSON.stringify(messageData))
           await safeRPush(key, JSON.stringify(messageData))
           const afterLen = await safeLLen(key)
@@ -638,113 +812,7 @@ app.post(PATH, async (req, res) => {
 }
 
   // --- DEBOUNCE / WAIT LOGIC ---
-  // Cancelar temporizador anterior para esta conversación/JID
-  if (pendingTimers[key]) {
-    clearTimeout(pendingTimers[key])
-    delete pendingTimers[key]
-  }
-
-  let debounceSeconds = Number(process.env.DEBOUNCE_SECONDS || '5')
-  // Rich media takes longer to produce/send multiple. Extend wait time for audio/image.
-  if (type === 'AUDIO' || type === 'IMAGEN' || type === 'IMAGE-TEXT') {
-     debounceSeconds = Math.max(debounceSeconds, 10)
-  }
-  const debounceMs = debounceSeconds * 1000
-  console.log(`Waiting ${debounceSeconds}s for more messages from ${jid}...`)
-  
-  pendingTimers[key] = setTimeout(async () => {
-      console.log(`debounce timeout jid=${jid} key=${key}`)
-      // Limpieza y obtencion del buffer final
-      const maxKeep2Raw = Number(process.env.REDIS_MAX_BUFFER || '20')
-      const maxKeep2 = Number.isFinite(maxKeep2Raw) && maxKeep2Raw >= 1 ? maxKeep2Raw : 20
-      
-      let list = await cleanRedisBuffer(key, maxKeep2)
-      
-      // Filtro final en memoria para eliminar duplicados por ID
-      const uniqueMap = new Map()
-      const uniqueList = []
-      for (const itemStr of list) {
-        try {
-          const item = JSON.parse(itemStr)
-          if (item.id) {
-            if (!uniqueMap.has(String(item.id))) {
-              uniqueMap.set(String(item.id), true)
-              uniqueList.push(itemStr)
-            }
-          } else {
-            uniqueList.push(itemStr)
-          }
-        } catch (_) {
-          uniqueList.push(itemStr)
-        }
-      }
-      list = uniqueList
-      
-      // Consumir (borrar) el buffer SIEMPRE para evitar duplicados en la siguiente llamada
-      await safeDel(key)
-      console.log(`buffer consumed key=${key}`)
-      delete pendingTimers[key]
-
-      // console.log(`Processing ${list.length} messages for forwarding:`, JSON.stringify(list))
-      if (list.length === 0) {
-        console.log(`no messages to forward jid=${jid} key=${key}`)
-        return
-      }
-        
-        // Extraemos los metadatos de conversación del último mensaje (el más reciente)
-        // o de cualquiera, asumiendo que es la misma conversación.
-        let conversationMeta = {}
-        let rootQuery = null
-        let rootWahaJid = null
-        let rootConvId = null
-
-        if (list.length > 0) {
-            try {
-                const lastItem = JSON.parse(list[list.length - 1])
-                if (lastItem._raw_conversation) {
-                    conversationMeta = lastItem._raw_conversation
-                }
-                rootQuery = lastItem._query
-                rootWahaJid = lastItem.waha_whatsapp_jid
-                rootConvId = lastItem.conversation_id
-            } catch (_) {}
-        }
-
-        const cleanedList = list
-          .map(itemStr => {
-            try {
-              const item = JSON.parse(itemStr)
-              return collapseSpaces(trimOrEmpty(item.mastertext || ''))
-            } catch (_) {
-              return ''
-            }
-          })
-          .filter(mt => !!mt)
-
-        const webhookBaseUrl = process.env.WEBHOOK_URL
-        const finalQ = rootQuery || queryQ
-        const targetUrl = webhookBaseUrl && finalQ ? `${webhookBaseUrl}?q=${encodeURIComponent(finalQ)}` : (webhookBaseUrl || '')
-
-        let responsePayload = {}
-        if (body && typeof body === 'object') {
-          responsePayload = { ...body }
-        }
-        responsePayload.mastertext = cleanedList || []
-        console.log(`forwarding grouped count=${responsePayload.mastertext.length} url=${targetUrl}`)
-
-        try {
-          console.log(`sending to webhook url=${targetUrl} count=${responsePayload.mastertext.length}`)
-          const r = await fetch(targetUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(responsePayload)
-          })
-          console.log(`webhook response status=${r.status} ok=${r.ok}`)
-          console.log(`forwarded grouped count=${responsePayload.mastertext.length} url=${targetUrl}`)
-        } catch (err) {
-          console.error('\x1b[31m%s\x1b[0m', `Error forwarding to EliteSeller: ${err.message}`)
-        }
-    }, debounceMs)
+  setDebounceTimer(jid, key, type, queryQ, body, true)
 
   return
 })
