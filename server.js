@@ -150,6 +150,15 @@ async function analyzeImage(dataUrl, prompt) {
     return { content: trimOrEmpty(cached.content || ''), cost: Number(cached.cost) || 0, tokens: Number(cached.tokens) || 0 }
   }
 
+  if (!isDataUrl(finalImageUrl)) {
+    try {
+      const { buf } = await fetchBuffer(finalImageUrl)
+      const mime = guessMimeFromUrl(finalImageUrl)
+      const b64 = buf.toString('base64')
+      finalImageUrl = `data:${mime};base64,${b64}`
+    } catch (_) {}
+  }
+
   if (!process.env.OPENAI_API_KEY) return { content: '', cost: 0, tokens: 0 }
   try {
     const openai = openaiClient || new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
